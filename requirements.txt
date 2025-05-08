@@ -1,0 +1,10 @@
+# requirements.txt
+google-generativeai
+PyMuPDF
+python-docx
+pdf2image
+pytesseract
+neo4j
+Pillow
+streamlit
+python-dotenv
