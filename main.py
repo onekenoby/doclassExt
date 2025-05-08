@@ -12,6 +12,10 @@ def main():
 
     # 2. Generate structured hierarchy, schema, and Cypher
     result = generate_structured_schema_and_cypher(text)
+    if not result or not result["cypher"]:
+        print("\n--- ERROR: No valid result or Cypher statements generated. ---\n")
+        return
+
     hierarchy = result["hierarchy"]
     schema = result["schema"]
     cypher_statements = result["cypher"]
@@ -26,4 +30,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

@@ -1,5 +1,7 @@
+# preprocess/ocr_extractor.py
 import pytesseract
 from PIL import Image
+
 
 def ocr_from_image(image_path_or_obj):
     """
