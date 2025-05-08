@@ -88,7 +88,7 @@ def generate_structured_schema_and_cypher(text: str) -> dict:
         # Set a lower temperature for more stable and deterministic results.
         # A value closer to 0 reduces randomness. Experiment with values
         # like 0.0, 0.1, 0.2 etc.
-        response = model.generate_content(prompt, generation_config={"temperature": 0.1})
+        response = model.generate_content(prompt, generation_config={"temperature": 0})
         payload = response.text.strip()
 
         # ── Strip possible ``` fences ──────────────────────────────
