@@ -1,135 +1,123 @@
 # gemini/gemini_client.py
+"""
+Re-prompt + hardened JSON handling for Gemini Flash 2.0
+"""
 
 import os
 import json
-import google.generativeai as genai
-from dotenv import load_dotenv, find_dotenv
 from json import JSONDecodeError
 
-# Load project‑root .env so that GEMINI_API_KEY loads correctly
-load_dotenv(find_dotenv())
+import google.generativeai as genai
+from dotenv import load_dotenv, find_dotenv
 
-# ──────────────── Gemini configuration ────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Gemini basic setup
+# ─────────────────────────────────────────────────────────────────────────────
+load_dotenv(find_dotenv())                               # allow .env at repo root
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# Initialize the GenerativeModel.
-# The temperature is set in the generate_content call for flexibility.
-model = genai.GenerativeModel(model_name="models/gemini-2.0-flash")
-
-
-############################################
-# Utility helper to grab the first JSON blob
-############################################
-
+#model = genai.GenerativeModel(model_name="models/gemini-2.0-flash")
+model = genai.GenerativeModel(model_name="models/gemini-2.5-flash-preview-04-17")
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helper: grab first {...} blob (best-effort) from messy output
+# ─────────────────────────────────────────────────────────────────────────────
 def extract_json(s: str) -> str:
-    """Return the first balanced‑brace JSON object found inside *s*."""
-    start = None
     depth = 0
+    start = None
     for i, ch in enumerate(s):
-        if ch == '{':
+        if ch == "{":
+            depth += 1
             if start is None:
                 start = i
-            depth += 1
-        elif ch == '}' and depth > 0:
+        elif ch == "}" and depth:
             depth -= 1
             if depth == 0 and start is not None:
-                return s[start: i + 1]
+                return s[start : i + 1]
     return s
 
 
-###############################################################
-# 1️⃣ MAIN ENTRY – STRUCTURED KG & CYPHER GENERATION PROMPT  #
-###############################################################
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN – generate hierarchy / schema / Cypher
+# ─────────────────────────────────────────────────────────────────────────────
 def generate_structured_schema_and_cypher(text: str) -> dict:
-    """Generate a structured schema and Cypher script from raw document text."""
-
-    # Tip: For very large documents, consider splitting the 'text' into smaller
-    # chunks and processing each chunk separately. You would then need to
-    # merge the results (hierarchy, schema, and cypher) from each chunk.
-    # This is a more advanced modification. Adjusting temperature is a good
-    # first step for improving stability.
-
-    prompt = f"""
-    Given raw document text, produce a rich JSON spec and Cypher script.
-
-    The prompt below is engineered to maximise **coverage** and **granularity**
-    of the resulting knowledge‑graph while keeping the output machine-parsable.
-    Aim for high *recall* while keeping *precision* acceptable (≥ 0.6).
-
-    **Crucially, prioritize valid Cypher syntax.** Follow these rules:
-    - Use CREATE statements to create nodes and relationships.
-    - Node creation: CREATE (node_variable:NodeType {{property1: value1, property2: value2, ...}})
-    - Relationship creation: CREATE (node1)-[:RELATIONSHIP_TYPE {{property1: value1, ...}}]->(node2)
-    - Always provide node labels (e.g., :Person, :Organization, :Document).
-    - Always provide relationship types (e.g., :RELATES_TO, :PART_OF, :HAS_PART).
-    - Do NOT include CREATE CONSTRAINT statements. These are handled separately.
-    - Ensure all strings are properly escaped if necessary.
-    - Return Cypher statements as a JSON array of strings.
-
-    Return **one** valid JSON object with **exactly** these keys:
-
-    1.  \"hierarchy\"  – a recursive outline capturing topical structure.
-    2.  \"schema\" – describes the graph model.
-    3.  \"cypher\" – **array** of Cypher statements.
-
-    ---
-
-    ## Extraction guidelines
-    • Create **separate nodes** for distinct real‑world entities: persons, orgs, locations, events, concepts, dates, numerical facts, URLs, etc.
-    • **Identify and extract ALL relationships** among the nodes, whether **explicit** or **implicit**.
-    • **Mandatory balance** – The graph must contain at least ⌈nodes ÷ 2⌉ relationship statements.
-    • Relationships **must** be emitted even if they're inferred or subtle (use `NO_RELATIONSHIP` for placeholders).
-
-    Document Text ↓↓↓
-    {text}
+    """
+    Ask Gemini to turn raw *text* into:
+       {
+         "hierarchy": ...,
+         "schema":    ...,
+         "cypher":    [...]
+       }
+    The prompt contains STRICT syntax+escaping instructions; we then attempt up
+    to 3 JSON-decode passes, progressively extracting the innermost braces.
     """
 
-    try:
-        # Set a lower temperature for more stable and deterministic results.
-        # A value closer to 0 reduces randomness. Experiment with values
-        # like 0.0, 0.1, 0.2 etc.
-        response = model.generate_content(prompt, generation_config={"temperature": 0})
-        payload = response.text.strip()
+    prompt = f"""
+Given raw document text, produce a *single* JSON object with three keys:
+ 1. "hierarchy"   – nested outline of the content
+ 2. "schema"      – {{ "node_labels": [...], "relationship_types": [...] }}
+ 3. "cypher"      – **array** of Cypher CREATE / MERGE statements
 
-        # ── Strip possible ``` fences ──────────────────────────────
-        # The model might wrap the JSON in markdown code blocks
-        if payload.startswith("```"):
-            lines = payload.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            payload = "\n".join(lines).strip()
+### Cypher rules
+- **Directed only** → in CREATE/MERGE you *must* use an arrow, e.g.
+      (a)-[:REL_TYPE]->(b)   or   (b)<-[:REL_TYPE]-(a)
+  Undirected `-[:REL]-` is forbidden.
+- Node labels and relationship types must start with a letter.
+  If the source name begins with a digit, either wrap it in back-ticks
+  (``:`3A_Informatica`` → :`3A_Informatica`) *or* prepend a letter
+  (e.g. 3A_Informatica → A3A_Informatica).
+- Map verbose names/descriptions to *properties* (usually `name` or
+  `description`) rather than in the label/type.
+- Do **NOT** emit CONSTRAINTS.
+- Aim for at least ⌈nodes ÷ 2⌉ relationships.
 
-        # ── Parse the JSON or fall back to best‑effort extraction ──
-        # Attempt to parse the direct output, or extract JSON if embedded
+### JSON escaping (critical)
+Inside the JSON you return **every back-slash must be doubled (\\\\)**.
+That includes the back-slashes the Cypher engine itself needs:
+- `\\`  → `\\\\`
+- `\"`  → `\\\"`
+- new-line → `\\\\n`, carriage return → `\\\\r`, etc.
+
+Document text ↓↓↓
+{text}
+"""
+
+    # ── Call Gemini with low randomness for stability ───────────────────────
+    response = model.generate_content(
+        prompt,
+        generation_config={
+            "temperature": 0,
+            ## "max_output_tokens": 2048,       # fix upper bound
+            "top_p": 1.0, "top_k": 0,        # disable sampling
+        },
+    )
+    payload = response.text.strip()
+
+    # Strip ``` fences if present
+    if payload.startswith("```"):
+        lines = payload.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        payload = "\n".join(lines).strip()
+
+    # ── Robust JSON decoding: try up to 3 times, each time tightening range ─
+    for attempt in range(3):
         try:
             return json.loads(payload)
-        except JSONDecodeError:
-            snippet = extract_json(payload)
-            try:
-                return json.loads(snippet)
-            except JSONDecodeError:
-                # If JSON extraction also fails, raise an error
-                raise ValueError(f"Invalid JSON received from model:\n{payload}")
-        except Exception as e:
-            # Catch any other exceptions during JSON processing
-            print(f"Error during JSON processing: {e}")
-            raise # Re-raise the exception to be handled by the caller
-    except Exception as e:
-        # Catch exceptions during the API call itself
-        print(f"ERROR: Gemini API call failed: {e}")
-        raise  # Re-raise the exception to be handled by the caller
+        except JSONDecodeError as err:
+            if attempt == 2:
+                print(f"Invalid JSON after 3 attempts: {err}")
+                raise ValueError(f"Invalid JSON received from model:\n{payload}") from err
+            # extract the *most* JSON-looking substring and retry
+            payload = extract_json(payload)
 
 
-################################################
-# 2️⃣ NATURAL‑LANGUAGE NARRATIVE (unchanged)   #
-################################################
-
+# ─────────────────────────────────────────────────────────────────────────────
+#  EXTRA – natural-language narrative (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 def generate_semantic_narrative(hierarchy: dict, schema: dict) -> str:
-    """Italian narrative summary of the graph structure for UI/tooltips."""
     h = json.dumps(hierarchy, ensure_ascii=False)
-    s = json.dumps(schema, ensure_ascii=False)
+    s = json.dumps(schema,    ensure_ascii=False)
     prompt = f"""
 Sei un esperto di knowledge graph. Usa la gerarchia e lo schema seguenti per
 produrre una narrazione fluida ed avvincente (in italiano) che spieghi cosa
@@ -144,12 +132,4 @@ Schema:
 
 Risposta:
 """
-    # Temperature can also be adjusted for the narrative generation if needed.
-    # For creative text like a narrative, a slightly higher temperature might
-    # be desirable, but for consistency, you might keep it low here too.
-    # We will leave it at the default for now as it's less critical for graph stability.
-    response = model.generate_content(prompt)
-    narrative = response.text.strip()
-    if narrative.startswith("```") and narrative.endswith("```"):
-        narrative = narrative.strip("```").strip()
-    return narrative
+    return model.generate_content(prompt).text.strip()
