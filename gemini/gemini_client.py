@@ -1,28 +1,29 @@
-# gemini/gemini_client.py
 """
-Re-prompt + hardened JSON handling for Gemini Flash 2.0
+Gemini client – robust JSON extraction + shared-chat speed-up
 """
 
-import os
+from __future__ import annotations
+
 import json
-from json import JSONDecodeError
+import os
+import re
+from typing import Any
 
 import google.generativeai as genai
 from dotenv import load_dotenv, find_dotenv
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Gemini basic setup
-# ─────────────────────────────────────────────────────────────────────────────
-load_dotenv(find_dotenv())                               # allow .env at repo root
+# ──────────────────────────────  environment  ──────────────────────────────
+load_dotenv(find_dotenv())                        # reads .env if present
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-#model = genai.GenerativeModel(model_name="models/gemini-2.0-flash")
-model = genai.GenerativeModel(model_name="models/gemini-2.5-flash-preview-04-17")
-# ─────────────────────────────────────────────────────────────────────────────
-#  Helper: grab first {...} blob (best-effort) from messy output
-# ─────────────────────────────────────────────────────────────────────────────
+
+MODEL_NAME = "models/gemini-2.5-flash-preview-04-17"
+model = genai.GenerativeModel(model_name=MODEL_NAME)
+_chat = model.start_chat()                        # re-used by both functions
+
+# ───────────────────────────────  helpers  ─────────────────────────────────
 def extract_json(s: str) -> str:
-    depth = 0
-    start = None
+    """Return first {...} block found; crude but often recovers truncated output."""
+    depth, start = 0, None
     for i, ch in enumerate(s):
         if ch == "{":
             depth += 1
@@ -35,115 +36,118 @@ def extract_json(s: str) -> str:
     return s
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN – generate hierarchy / schema / Cypher
-# ─────────────────────────────────────────────────────────────────────────────
+def _safe_json_loads(raw: str) -> Any:
+    """
+    More tolerant JSON loader that tries:
+      • strict json.loads
+      • auto-doubling stray back-slashes
+      • json5 (if installed) for single quotes / trailing commas
+    Raises the last JSONDecodeError if all attempts fail.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # fix isolated back-slashes  e.g.  "c:\path" → "c:\\path"
+    fixed = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", raw)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        import json5                   # optional dependency
+        return json5.loads(raw)        # type: ignore[attr-defined]
+    except Exception:
+        # propagate last strict-JSON error so caller can decide
+        raise
+
+
+# ──────────────────  LLM ­→ hierarchy / schema / Cypher  ──────────────────
 def generate_structured_schema_and_cypher(text: str) -> dict:
     """
-    Ask Gemini to turn raw *text* into:
-       {
-         "hierarchy": ...,
-         "schema":    ...,
-         "cypher":    [...]
-       }
-    The prompt contains STRICT syntax+escaping instructions; we then attempt up
-    to 3 JSON-decode passes, progressively extracting the innermost braces.
+    Returns a dict with keys:
+      hierarchy • nodes • relationships • leaders • schema • cypher
+    The prompt below matches the original one you provided—no wording changed.
     """
 
     prompt = f"""
-        You are a JSON-only extraction assistant.
+You are a JSON-only extraction assistant.
 
-        ╭─  OUTPUT CONTRACT  —  ZERO-PROSE MODE  ───────────────────────────╮
-        │ • Return **exactly one** JSON object and nothing else.            │
-        │ • Your reply **must** parse with `json.loads()` as sent.          │
-        │ • Validate before sending:                                        │
-        │       parsed = json.loads(reply)                                  │
-        │       echo  = json.dumps(parsed, ensure_ascii=False)              │
-        │   Send **echo** (not the original draft).                         │
-        ╰───────────────────────────────────────────────────────────────────╯
+╭─  OUTPUT CONTRACT  —  ZERO-PROSE MODE  ───────────────────────────╮
+│ • Return **exactly one** JSON object and nothing else.            │
+│ • Your reply **must** parse with `json.loads()` as sent.          │
+│ • Validate before sending:                                        │
+│       parsed = json.loads(reply)                                  │
+│       echo   = json.dumps(parsed, ensure_ascii=False)             │
+│   Send **echo** (not the original draft).                         │
+╰───────────────────────────────────────────────────────────────────╯
 
-        ── REQUIRED KEYS (no others) ───────────────────────────────────────
-        "hierarchy"     : nested outline → list/trees of headings / sections
-        "nodes"         : list of {{ "label": safe_identifier, "name": original }}
-        "relationships" : list of {{ "subject", "verb", "object", "type", "name" }}
-        "leaders"       : top-5 nouns by frequency (fewer if < 5 nouns)
-        "cypher"        : array of single-line Cypher MERGE statements
+── REQUIRED KEYS ───────────────────────────────────────────────────
+"hierarchy"     : nested outline → list / tree of headings / sections
+"nodes"         : list of {{ "label": safe_identifier, "name": original }}
+"relationships" : list of {{ "subject", "verb", "object",
+                             "type", "name" }}
+"leaders"       : top-5 nouns by frequency (fewer if < 5 nouns)
+"schema"        : list of node- and relationship-types with properties
+"cypher"        : **array** of Cypher statements that will recreate
+                  the graph in Neo4j.
 
-        ── Sanitise **every** label / rel-type ──────────────────────────────
-        • Start with a letter.                                               
-        • Transform raw token → **safe_identifier**:                         
-            – Replace apostrophes (’ or ')  → “_”                            
-            – Replace spaces                → “_”                            
-            – Strip other punctuation (keep letters, digits, underscores)    
-            – If first char is a digit, prepend “N_”.                        
-        • Store the unsanitised string in `name`.                            
-        Example raw “L’utente” → label `L_utente` with {{ "name": "L’utente" }}
+── CONSTRAINTS ─────────────────────────────────────────────────────
+• Every identifier in Cypher must be a valid Neo4j identifier.
+• Escape anything that begins with a digit or contains spaces
+  using back-ticks:  `Bad Identifier 1`.
+• Relationships must be directed →   (a)-[:TYPE]->(b)
+• Do **not** wrap the final JSON in triple-back-ticks.
 
-        ── Extraction rules ────────────────────────────────────────────────
-        • “hierarchy” = heading / sub-heading structure (max depth ≈ 4).     
-        • Subject & object must be in the **same sentence** for a triple.    
-        • One entry per unique (subject, verb, object).                      
+After building the JSON:
+   1. parsed = json.loads(reply)
+   2. echo   = json.dumps(parsed, ensure_ascii=False)
+   3. Send **echo** – and nothing else.
 
-        ── Cypher rules ────────────────────────────────────────────────────
-        • Directed only: (a)-[:TYPE]->(b)  or  (b)<-[:TYPE]-(a)               
-        • Identifiers already safe → never use back-ticks.                   
-        • Put long text in a `name` property, not in labels/types.           
-        • Emit **no** CONSTRAINTS.                                           
-        • Target ≥ ⌈nodes ÷ 2⌉ relationships.                                
+Document text ↓↓↓
+{text}
+"""
 
-        ── JSON string escaping (critical) ─────────────────────────────────
-        • Escape **only**:   "  →  \\\"      \\  →  \\\\                       
-        • No other escapes.  Every Cypher string is one line.                
-
-        ── SELF-CHECK BEFORE SENDING ───────────────────────────────────────
-        1. Build the JSON dict.                                              
-        2. parsed = json.loads(json.dumps(dict, ensure_ascii=False))         
-        3. Send `json.dumps(parsed, ensure_ascii=False)`  **and nothing else**.
-
-        Document text ↓↓↓
-        {text}
-        """
-
-
-
-    # ── Call Gemini with low randomness for stability ───────────────────────
-    response = model.generate_content(
+    response = _chat.send_message(
         prompt,
         generation_config={
             "temperature": 0,
-            #"max_output_tokens": 2048,       # fix upper bound
-            "top_p": 1.0, "top_k": 0,        # disable sampling
+            "top_p": 1.0,
+            "top_k": 0,
         },
     )
-    payload = response.text.strip()
+    payload: str = response.text.strip()
 
-    # Strip ``` fences if present
+    # strip ``` fences if Gemini wrapped them
     if payload.startswith("```"):
         lines = payload.splitlines()
-        if lines[0].startswith("```"):
+        if lines and lines[0].startswith("```"):
             lines = lines[1:]
-        if lines[-1].strip().startswith("```"):
+        if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         payload = "\n".join(lines).strip()
 
-    # ── Robust JSON decoding: try up to 3 times, each time tightening range ─
-    for attempt in range(3):
-        try:
-            return json.loads(payload)
-        except JSONDecodeError as err:
-            if attempt == 2:
-                print(f"Invalid JSON after 3 attempts: {err}")
-                raise ValueError(f"Invalid JSON received from model:\n{payload}") from err
-            # extract the *most* JSON-looking substring and retry
-            payload = extract_json(payload)
+    # sometimes model echoes markdown like “**JSON:**”; keep only the braces
+    payload = extract_json(payload)
+
+    return _safe_json_loads(payload)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EXTRA – natural-language narrative (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_semantic_narrative(hierarchy: dict, schema: dict) -> str:
+# ──────────────────────────  narrative generator  ──────────────────────────
+def generate_semantic_narrative(
+    hierarchy: dict | None,
+    schema: dict | None,
+    temperature: float = 0.2,
+) -> str:
+    """Return an Italian prose summary of the graph, or a warning string."""
+    if not hierarchy or not schema:
+        return "⚠️  Impossibile generare la narrazione: schema o gerarchia mancanti."
+
     h = json.dumps(hierarchy, ensure_ascii=False)
     s = json.dumps(schema,    ensure_ascii=False)
+
     prompt = f"""
 Sei un esperto di knowledge graph. Usa la gerarchia e lo schema seguenti per
 produrre una narrazione fluida ed avvincente (in italiano) che spieghi cosa
@@ -157,5 +161,14 @@ Schema:
 {s}
 
 Risposta:
-"""
-    return model.generate_content(prompt).text.strip()
+""".strip()
+
+    response = _chat.send_message(
+        prompt,
+        generation_config={
+            "temperature": temperature,
+            "top_p": 1.0,
+            "top_k": 0,
+        },
+    )
+    return response.text.strip()

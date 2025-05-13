@@ -1,135 +1,94 @@
-# main.py
-from preprocess.text_extractor import extract_text_from_file
+"""
+End-to-end runner for PDF → text → Gemini → Neo4j graph
+"""
+
+from __future__ import annotations
+
+import sys
+import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
 from gemini.gemini_client import (
     generate_structured_schema_and_cypher,
-    generate_semantic_narrative # You might adjust how narrative is generated with chunking
+    generate_semantic_narrative,
 )
-# Import the function for individual query execution
-from graphdb.graph_builder import execute_cypher_queries_individually
+from graphdb.graph_builder import execute_cypher_batched
+from preprocess.text_extractor import extract_text_from_file
 
-# --- Configuration ---
-CHUNK_SIZE = 4000  # Approximate characters per chunk. Adjust based on your document and testing.
-# You might need a chunking strategy that respects paragraph/sentence boundaries
-# for better results, but simple character-based splitting is shown here.
+# ───────────────────────────  settings  ────────────────────────────
+CHUNK_SIZE  = 6_000        # characters per LLM call
+MAX_WORKERS = 4            # parallel Gemini calls (watch your quota)
 
+# -------------------------------------------------------------------
 def simple_text_chunker(text: str, chunk_size: int):
-    """Splits text into chunks of approximately chunk_size."""
-    # A more sophisticated chunker would consider sentence/paragraph boundaries
-    words = text.split()
-    chunks = []
-    current_chunk = []
-    current_size = 0
-
-    for word in words:
-        # Add 1 for the space character
-        if current_size + len(word) + 1 > chunk_size:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_size = len(word)
-        else:
-            current_chunk.append(word)
-            current_size += len(word) + 1
-
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-
-    return chunks
+    """Split text into word-boundary chunks of ≤ chunk_size."""
+    return textwrap.wrap(text, width=chunk_size,
+                         break_long_words=False,
+                         break_on_hyphens=False)
 
 
-def main():
-    # 1. Extract raw document text
-    # Make sure to use the correct path to sample.pdf
-    # Adjusted path assuming sample.pdf is in the same dir as main.py. Adjust if needed.
-    file_path = "samples/sample.pdf"
-    print(f"Extracting text from {file_path}...")
+def main() -> None:
+    # --------  pick PDF path  --------------------------------------
+    if len(sys.argv) > 1:
+        file_path = Path(sys.argv[1])
+    else:
+        file_path = Path("samples/sample.pdf")
+
+    print(f"Extracting text from {file_path} …")
     paragraphs = extract_text_from_file(file_path)
-    doc_text = "\n".join(paragraphs)
-    print(f"Text extracted. Total characters: {len(doc_text)}")
+    full_text  = "\n".join(paragraphs)
 
+    chunks = simple_text_chunker(full_text, CHUNK_SIZE)
+    print(f"Document split into {len(chunks)} chunk(s).")
 
-    # 2. Split text into chunks
-    chunks = simple_text_chunker(doc_text, CHUNK_SIZE)
-    print(f"Document split into {len(chunks)} chunks.")
+    all_cypher: list[str] = []
+    all_hierarchies: list[dict] = []
+    all_schemas: list[dict] = []
 
-    all_cypher_statements = []
-    all_hierarchies = [] # You would need merging logic for these
-    all_schemas = []     # You would need merging logic for these
+    # --------  parallel LLM calls  ---------------------------------
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {
+            pool.submit(generate_structured_schema_and_cypher, chunk): idx
+            for idx, chunk in enumerate(chunks, 1)
+        }
 
-    print("\n--- Processing Chunks ---")
-    for i, chunk in enumerate(chunks):
-        print(f"\nProcessing Chunk {i+1}/{len(chunks)} (Size: {len(chunk)} characters)...")
-
-        # 3. Generate structured hierarchy, schema, and Cypher for the chunk
-        # This call now uses the gemini_client with lower temperature
-        try:
-            chunk_result = generate_structured_schema_and_cypher(chunk)
-            if not chunk_result or not chunk_result.get("cypher"): # Use .get() for safer access
-                print(f"--- WARNING: No valid result or Cypher statements generated for Chunk {i+1}. ---")
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                print(f"✖️  Chunk {idx} failed: {e}")
                 continue
 
-            chunk_hierarchy = chunk_result.get("hierarchy")
-            chunk_schema = chunk_result.get("schema")
-            chunk_cypher_statements = chunk_result.get("cypher", [])
+            if not isinstance(res, dict):
+                print(f"✖️  Chunk {idx} produced no usable JSON.")
+                continue
 
-            all_hierarchies.append(chunk_hierarchy) # Collect results
-            all_schemas.append(chunk_schema)       # Collect results
-            all_cypher_statements.extend(chunk_cypher_statements) # Collect all Cypher statements
+            all_hierarchies.append(res.get("hierarchy"))
+            all_schemas.append(res.get("schema"))
+            cypher_part = res.get("cypher", [])
+            if isinstance(cypher_part, str):
+                all_cypher.extend([s for s in cypher_part.split(";") if s.strip()])
+            elif isinstance(cypher_part, list):
+                all_cypher.extend(cypher_part)
+            print(f"✅ Chunk {idx} done.")
 
-            # Optional: Print results for each chunk
-            # print(f"Hierarchy for Chunk {i+1}: {json.dumps(chunk_hierarchy, indent=2)}")
-            # print(f"Schema for Chunk {i+1}: {json.dumps(chunk_schema, indent=2)}")
-            # print(f"Cypher statements for Chunk {i+1}:")
-            # for stmt in chunk_cypher_statements:
-            #     print(stmt)
-
-        except Exception as e:
-            print(f"--- ERROR processing Chunk {i+1}: {e} ---")
-
-
-    print("\n--- Finished Processing Chunks ---")
-
-    # --- Merging Results (Conceptual - Requires Implementation) ---
-    # At this point, you have lists of hierarchies, schemas, and a combined
-    # list of all Cypher statements from all chunks.
-    # A full implementation would require logic here to:
-    # 1. Merge `all_hierarchies` into a single document hierarchy.
-    # 2. Merge `all_schemas` into a single overall schema (collecting all unique node labels and relationship types).
-    # 3. Process `all_cypher_statements` to build the graph. This is the most complex part.
-    #    Simply running all statements might work if `execute_cypher_queries_individually`
-    #    handles variable scope correctly, but you might get duplicate nodes for entities
-    #    mentioned in multiple chunks. A robust solution would involve using MERGE
-    #    statements or post-processing the Cypher to identify and merge duplicate nodes.
-
-    # For demonstration, we will execute the collected Cypher statements individually.
-    # This resolves variable conflicts *within* each statement but might create
-    # duplicate nodes if the same entity appears in different chunks.
-    print("\n--- Executing All Collected Cypher Statements ---")
-    if all_cypher_statements:
-        execute_cypher_queries_individually(all_cypher_statements)
+    # --------  write graph  ----------------------------------------
+    if all_cypher:
+        print("\nWriting graph to Neo4j …")
+        execute_cypher_batched(all_cypher)
     else:
-        print("No Cypher statements collected to execute.")
+        print("\n⚠️  No Cypher statements were generated – graph step skipped.")
 
-    # 4. Semantic interpretation narrative (using collected or merged schema/hierarchy)
-    # For a full document narrative, you would ideally use a merged hierarchy and schema.
-    # For simplicity here, we might generate a narrative based on the collected schema/hierarchy
-    # or process the original text again with a different prompt focused on summarization.
-    # Or, you could take the largest/most representative chunk's narrative.
-    # This part needs adjustment based on how you implement merging.
-    # As a placeholder, let's use the schema/hierarchy from the first chunk if available,
-    # or a simple message if not.
-
-    print("\n=== Generating Semantic Interpretation ===")
+    # --------  optional narrative  ---------------------------------
     if all_hierarchies and all_schemas:
-        # Using the first chunk's schema/hierarchy for narrative as a simple example
-        # Replace with logic using merged_hierarchy and merged_schema in a full implementation
         try:
-             narrative = generate_semantic_narrative(all_hierarchies[0], all_schemas[0])
-             print("\n" + narrative)
+            narrative = generate_semantic_narrative(all_hierarchies[0], all_schemas[0])
+            print("\n=== Semantic Narrative ===\n")
+            print(narrative)
         except Exception as e:
-             print(f"--- ERROR generating semantic narrative: {e} ---")
-             print("Narrative generation skipped.")
-    else:
-        print("Cannot generate semantic narrative: No schema or hierarchy available from chunks.")
+            print(f"✖️  Narrative skipped: {e}")
 
 
 if __name__ == "__main__":
