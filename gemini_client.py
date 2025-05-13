@@ -51,7 +51,6 @@ def generate_structured_schema_and_cypher(text: str) -> dict:
     """
 
     prompt = f"""
-<<<<<<< HEAD
         You are a JSON-only extraction assistant.
 
         ╭─  OUTPUT CONTRACT  —  ZERO-PROSE MODE  ───────────────────────────╮
@@ -103,50 +102,15 @@ def generate_structured_schema_and_cypher(text: str) -> dict:
 
         Document text ↓↓↓
         {text}
-        """
-
-
-=======
-Given raw document text, produce a *single* JSON object with three keys:
- 1. "hierarchy"   – nested outline of the content
- 2. "schema"      – {{ "node_labels": [...], "relationship_types": [...] }}
- 3. "cypher"      – **array** of Cypher CREATE / MERGE statements
-
-### Cypher rules
-- **Directed only** → in CREATE/MERGE you *must* use an arrow, e.g.
-      (a)-[:REL_TYPE]->(b)   or   (b)<-[:REL_TYPE]-(a)
-  Undirected `-[:REL]-` is forbidden.
-- Node labels and relationship types must start with a letter.
-  If the source name begins with a digit, either wrap it in back-ticks
-  (``:`3A_Informatica`` → :`3A_Informatica`) *or* prepend a letter
-  (e.g. 3A_Informatica → A3A_Informatica).
-- Map verbose names/descriptions to *properties* (usually `name` or
-  `description`) rather than in the label/type.
-- Do **NOT** emit CONSTRAINTS.
-- Aim for at least ⌈nodes ÷ 2⌉ relationships.
-
-### JSON escaping (critical)
-Inside the JSON you return **every back-slash must be doubled (\\\\)**.
-That includes the back-slashes the Cypher engine itself needs:
-- `\\`  → `\\\\`
-- `\"`  → `\\\"`
-- new-line → `\\\\n`, carriage return → `\\\\r`, etc.
-
-Document text ↓↓↓
-{text}
 """
->>>>>>> a30569cba5e4e4fe2e1f29cf87f4eef8590d17b7
+
 
     # ── Call Gemini with low randomness for stability ───────────────────────
     response = model.generate_content(
         prompt,
         generation_config={
             "temperature": 0,
-<<<<<<< HEAD
             #"max_output_tokens": 2048,       # fix upper bound
-=======
-            ## "max_output_tokens": 2048,       # fix upper bound
->>>>>>> a30569cba5e4e4fe2e1f29cf87f4eef8590d17b7
             "top_p": 1.0, "top_k": 0,        # disable sampling
         },
     )
